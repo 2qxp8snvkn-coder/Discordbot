@@ -6,7 +6,21 @@
 ║   For authorized security testing only                      ║
 ╚══════════════════════════════════════════════════════════════╝
 """
-
+"""SELF-HEALING IMPORT — ensures discord.py-self is loaded"""
+import subprocess, sys
+try:
+    import discord
+    # Verify we have Intents (discord.py-self specific)
+    _ = discord.Intents.all
+except AttributeError:
+    print("⚠️ Wrong discord library detected. Auto-fixing...")
+    subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "discord", "discord.py", "-y"])
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "--force-reinstall",
+                           "git+https://github.com/dolfies/discord.py-self.git"])
+    print("✅ Fixed! Restarting...")
+    subprocess.check_call([sys.executable] + sys.argv)
+    sys.exit(0)
+    
 import discord
 from discord.ext import commands, tasks
 from discord.ext.commands import UserConverter
