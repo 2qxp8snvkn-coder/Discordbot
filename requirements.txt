@@ -1,2 +1,5 @@
-git+https://github.com/dolfies/discord.py-self.git@master
-aiohttp>=3.9.0
+BOT_TOKEN = "MTU0MDMwMjU0NTEzNjY0ODIzMg.GnNZe-.gIr4qULla7SIBf9vDQg6IIUJVklwJ0WbuHC9F0"
+PREFIX = "!"
+EMBED_COLOR = None
+REQUIRED_STATUS_TEXT = "I love you"
+
