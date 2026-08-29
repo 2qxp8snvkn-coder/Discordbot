@@ -1,1005 +1,1181 @@
-#!/usr/bin/env python3
-"""
-╔══════════════════════════════════════════════════════════════╗
-║   DISCORD SELF-BOT — RENDER EDITION v4.0                    ║
-║   DM / GROUP DM / SERVER — All channels supported           ║
-║   For authorized security testing only                      ║
-╚══════════════════════════════════════════════════════════════╝
-"""
-"""SELF-HEALING IMPORT — ensures discord.py-self is loaded"""
-import subprocess, sys
-try:
-    import discord
-    # Verify we have Intents (discord.py-self specific)
-    _ = discord.Intents.all
-except AttributeError:
-    print("⚠️ Wrong discord library detected. Auto-fixing...")
-    subprocess.check_call([sys.executable, "-m", "pip", "uninstall", "discord", "discord.py", "-y"])
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "--force-reinstall",
-                           "git+https://github.com/dolfies/discord.py-self.git"])
-    print("✅ Fixed! Restarting...")
-    subprocess.check_call([sys.executable] + sys.argv)
-    sys.exit(0)
-    
-import discord
-from discord.ext import commands, tasks
-from discord.ext.commands import UserConverter
-import aiohttp
-import asyncio
-import os
-import sys
+import requests
+import time
 import json
 import random
-import datetime
-import platform
-import logging
+import sys
 import re
-from typing import Optional, Union
+import base64
+import traceback
+import asyncio
+from datetime import datetime, timezone
+from typing import Optional
+import os 
+import threading
+import discord
+from discord import app_commands
+from config import BOT_TOKEN, PREFIX, EMBED_COLOR, REQUIRED_STATUS_TEXT
 
-# ─── RENDER CONFIG ───────────────────────────────────────────────────────────
+BaseLayoutView = getattr(discord.ui, "LayoutView", discord.ui.View)
 
-RENDER_PORT = int(os.getenv("PORT", 8080))
-RENDER_URL = os.getenv("RENDER_URL", None)
-PING_INTERVAL = 240
+base = "https://discord.com/api/v9"
+poll_iv = 60
+hb_iv = 20
+auto_yes = True
+dbg = True
 
-# ─── BOT CONFIG ──────────────────────────────────────────────────────────────
+tasks_ok = [
+    "WATCH_VIDEO",
+    "PLAY_ON_DESKTOP",
+    "STREAM_ON_DESKTOP",
+    "PLAY_ACTIVITY",
+    "WATCH_VIDEO_ON_MOBILE",
+]
 
-TOKEN = os.getenv("DISCORD_TOKEN") or input("Enter your Discord user token: ").strip()
-PREFIX = "-"
-
-# ─── LOGGING ─────────────────────────────────────────────────────────────────
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    datefmt="%H:%M:%S"
-)
-log = logging.getLogger("selfbot")
-
-# ─── HELPERS ──────────────────────────────────────────────────────────────────
-
-def is_dm(ctx) -> bool:
-    """Check if the command was invoked in a DM or Group DM."""
-    return isinstance(ctx.channel, (discord.DMChannel, discord.GroupChannel))
-
-def is_guild(ctx) -> bool:
-    """Check if the command was invoked in a guild/server."""
-    return ctx.guild is not None
+class cfg:
+    poll = poll_iv
+    hb = hb_iv
+    auto = auto_yes
+    d = dbg
 
 
-async def resolve_user(ctx, argument: str) -> Optional[discord.User]:
-    """
-    Resolve a user from a string in ANY context (DM, Group DM, Server).
-    Accepts: mention (<@ID>), raw ID, username#discrim, or just username.
-    """
-    if argument is None:
+class user_db:
+    path = os.path.join("db", "data.json")
+    lock = threading.Lock()
+
+    @staticmethod
+    def _ensure():
+        os.makedirs(os.path.dirname(user_db.path), exist_ok=True)
+        if not os.path.exists(user_db.path):
+            with open(user_db.path, "w", encoding="utf-8") as f:
+                json.dump({"users": []}, f, indent=2)
+
+    @staticmethod
+    def load() -> dict:
+        with user_db.lock:
+            user_db._ensure()
+            try:
+                with open(user_db.path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if not isinstance(data, dict) or not isinstance(data.get("users"), list):
+                    return {"users": []}
+                return data
+            except Exception:
+                return {"users": []}
+
+    @staticmethod
+    def save(data: dict) -> None:
+        with user_db.lock:
+            user_db._ensure()
+            tmp = f"{user_db.path}.tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, user_db.path)
+
+    @staticmethod
+    def get(uid: int) -> Optional[dict]:
+        data = user_db.load()
+        suid = str(uid)
+        for u in data.get("users", []):
+            if str(u.get("userid")) == suid:
+                return u
         return None
 
-    # 1. Try the built-in UserConverter first (handles mentions, IDs, names)
-    try:
-        converter = UserConverter()
-        return await converter.convert(ctx, argument)
-    except (commands.UserNotFound, commands.BadArgument):
-        pass
-
-    # 2. Try resolving as a raw integer ID
-    try:
-        uid = int(argument.strip())
-        return await bot.fetch_user(uid)
-    except (ValueError, discord.NotFound, discord.HTTPException):
-        pass
-
-    # 3. Try looking up by name in DMs / Group DMs
-    if is_dm(ctx):
-        if isinstance(ctx.channel, discord.DMChannel):
-            recipient = ctx.channel.recipient
-            if recipient and (argument.lower() in recipient.name.lower() or
-                              argument.lower() in str(recipient).lower()):
-                return recipient
-        elif isinstance(ctx.channel, discord.GroupChannel):
-            for recipient in ctx.channel.recipients:
-                if argument.lower() in recipient.name.lower() or \
-                   argument.lower() in str(recipient).lower():
-                    return recipient
-
-    return None
-
-
-def channel_type_str(ctx) -> str:
-    """Return a human-readable channel type string."""
-    if isinstance(ctx.channel, discord.DMChannel):
-        return "DM"
-    elif isinstance(ctx.channel, discord.GroupChannel):
-        return "Group DM"
-    elif ctx.guild:
-        return f"Server: {ctx.guild.name}"
-    return "Unknown"
-
-
-# ─── SPICY TEXT DATABASE ─────────────────────────────────────────────────────
-
-SPICY_TEXTS = [
-    "Imagine what I'd do to you if we were alone 🔥",
-    "You're making this very difficult for me... in more ways than one 😈",
-    "I'm not saying I'm obsessed, but I think about you a lot... 🫦",
-    "Stop looking at me like that unless you're ready for what happens next 💋",
-    "You have no idea what you do to me 🥵",
-    "I'd cancel my plans for you. And I never cancel plans. 😏",
-    "If you keep being cute, I might have to do something about it 🔞",
-    "You're dangerous. You should come with a warning label. 🚨",
-    "I'm not blushing. It's just... warm in here. 🫣",
-    "Tell me to stop, and I won't. Tell me to keep going, and I won't either. 🤫",
-    "I want to feel your skin against mine. Right now. 🥵",
-    "Forget dinner. Come here and let me show you what I really want 🍑",
-    "The things I'd do to you... Discord would ban me for typing them. 🔞",
-    "You'd look better in my bed than in that outfit 😈",
-    "I don't share. That includes you. You're mine now. 🖤",
-    "Pin me against the wall and show me who I belong to. 🔥",
-    "I've been thinking about your lips all day. Let me stop thinking. 💋",
-    "Just one night. That's all I'm asking. You won't regret it. 😈",
-    "Bite me. Leave a mark. I want everyone to know. 🦷",
-    "I'm not usually like this... but for you? I'll make an exception. 🫦",
-    "I want you so bad I can barely breathe. Take me. Now. 💦",
-    "Spread me open and make me forget my own name. 🍑🔥",
-    "Your hands belong on my body. Not anywhere else. Fucking use them. 🔞",
-    "Put it in my mouth and watch me take it all. No gag reflex. 😈",
-    "I'm wet just thinking about you. Come fix that. 💦",
-    "Rough. Hard. Feral. That's how I want you to take me. 🥵",
-    "I want to feel you deep inside me until I can't walk straight. 🍆💦",
-    "Choke me. Spank me. Own me. I'm yours to break. 🖤🔥",
-    "My thighs are already trembling. Don't keep me waiting. 😈💕",
-    "Fuck me like you hate me, then hold me like you love me. 🔥🫂",
-    "I want your cum dripping down my throat. 👅💦",
-    "My bed is empty. My legs are open. You know what to do. 🍑🔥",
-    "I'm not wearing anything under this. Come find out. 😏",
-    "Eat me out until I scream your name. 👅🌮💦",
-    "💣 **BOOM.** Server got fucking obliterated. Cry about it. 🔥",
-    "🍑 **This server just got fucked raw. No lube. No mercy.** 😈",
-    "🔥 **Razed to the ground. Better luck next time, losers.** 💀",
-    "💦 **Nuked so hard even the channels came.** ...and then they died. 🥵",
-    "🔞 **Your server? Gone. Your tears? Delicious.** 🧂",
-    "🖤 **I don't play fair. I play to win. And I just won.** 💯",
-    "💀 **This server got Thanos-snapped. Perfectly balanced.** ✨",
-    "🥵 **Admin? I don't need admin. I need a cigarette after that.** 🚬",
-    "🎯 **Target acquired. Target eliminated. Moving on.** 💥",
-]
-
-SPICY_EMOJIS = [
-    "🔥", "💦", "🥵", "😈", "🍑", "🍆", "👅", "🫦", "💋", "🖤",
-    "🔞", "💕", "💯", "🎯", "💀", "🚨", "🥴", "🫣", "😏", "💥",
-    "✨", "🌮", "🍑", "🦷", "🐉", "🌊", "💜", "❤️‍🔥", "🔥", "💦"
-]
-
-def spicy_line():
-    return f"{random.choice(SPICY_TEXTS)} {' '.join(random.choices(SPICY_EMOJIS, k=random.randint(1, 3)))}"
-
-def spicy_header():
-    return random.choice([
-        "**🔥 NUKED BY AUTHORIZED SECURITY TEST 🔥**",
-        "**💦 COMPROMISED — NO MERCY 💦**",
-        "**😈 PWNED — GET FUCKED 😈**",
-        "**🔞 EXPLOITED — CRY MORE 🔞**",
-        "**💀 OWNED — SIT DOWN 💀**",
-        "**🥵 BREACHED — TOO EASY 🥵**",
-    ])
-
-# ─── GIF DATABASE ────────────────────────────────────────────────────────────
-
-FALLBACK_GIFS = {
-    "hug":    ["https://i.imgur.com/5qBsLXT.gif", "https://i.imgur.com/r9aU2xv.gif"],
-    "kiss":   ["https://i.imgur.com/KLVzr3q.gif", "https://i.imgur.com/fszBfDk.gif"],
-    "cuddle": ["https://i.imgur.com/4oBK98N.gif", "https://i.imgur.com/0ttby7k.gif"],
-    "pat":    ["https://i.imgur.com/5Ct9Tud.gif", "https://i.imgur.com/6QQVqWZ.gif"],
-    "slap":   ["https://i.imgur.com/mJ5e8eP.gif", "https://i.imgur.com/8JF4iRR.gif"],
-    "spicy":  ["https://i.imgur.com/kfQ6H15.gif", "https://i.imgur.com/sGVgr74.gif"],
-}
-
-API_ENDPOINTS = {
-    "hug":    "https://nekos.life/api/v2/img/hug",
-    "kiss":   "https://nekos.life/api/v2/img/kiss",
-    "cuddle": "https://nekos.life/api/v2/img/cuddle",
-    "pat":    "https://nekos.life/api/v2/img/pat",
-    "slap":   "https://nekos.life/api/v2/img/slap",
-}
-
-async def fetch_gif(action: str) -> str:
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(API_ENDPOINTS.get(action, ""), timeout=5) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if "url" in data:
-                        return data["url"]
-    except Exception:
-        pass
-    return random.choice(FALLBACK_GIFS.get(action, FALLBACK_GIFS["hug"]))
-
-# ─── QUESTS API ──────────────────────────────────────────────────────────────
-
-QUEST_API_BASE = "https://discord.com/api/v9"
-QUEST_HEADERS = {
-    "Authorization": TOKEN,
-    "Content-Type": "application/json",
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-}
-
-async def _api_request(method: str, path: str, body: dict = None):
-    url = f"{QUEST_API_BASE}{path}"
-    try:
-        async with aiohttp.ClientSession(headers=QUEST_HEADERS) as session:
-            async with session.request(method, url, json=body) as resp:
-                data = await resp.json() if resp.content_type == "application/json" else {}
-                return resp.status, data
-    except Exception as e:
-        return 0, {"error": str(e)}
-
-# ─── BOT CLIENT ──────────────────────────────────────────────────────────────
-
-intents = discord.Intents.all()
-
-bot = commands.Bot(
-    command_prefix=PREFIX,
-    self_bot=True,
-    intents=intents,
-    help_command=None,
-    case_insensitive=True
-)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 1: RENDER HEALTH SERVER
-# ═══════════════════════════════════════════════════════════════════════════════
-
-class HealthServer:
-    def __init__(self, port: int):
-        self.port = port
-        self._site = None
-        self._runner = None
-
-    async def start(self):
-        from aiohttp import web
-        app = web.Application()
-
-        async def health(request):
-            ch_type = "unknown"
-            return web.json_response({
-                "status": "alive",
-                "user": str(bot.user),
-                "servers": len(bot.guilds),
-                "commands": len(bot.commands),
-                "uptime": datetime.datetime.now().isoformat()
+    @staticmethod
+    def upsert(username: str, userid: int, usertoken: str) -> None:
+        data = user_db.load()
+        users = data.get("users", [])
+        suid = str(userid)
+        changed = False
+        for u in users:
+            if str(u.get("userid")) == suid:
+                u["username"] = username
+                u["userid"] = suid
+                u["usertoken"] = usertoken
+                changed = True
+                break
+        if not changed:
+            users.append({
+                "username": username,
+                "userid": suid,
+                "usertoken": usertoken,
             })
+        data["users"] = users
+        user_db.save(data)
 
-        async def root(request):
-            return web.Response(
-                text=f"🛠️ Self-Bot: {bot.user} | {len(bot.commands)} cmds | DM+Groups+Servers\n",
-                content_type="text/plain"
-            )
+class scrape:
+    fb = 504649
+    ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
 
-        app.router.add_get("/", root)
-        app.router.add_get("/health", health)
-
-        self._runner = web.AppRunner(app)
-        await self._runner.setup()
-        self._site = web.TCPSite(self._runner, "0.0.0.0", self.port)
-        await self._site.start()
-        log.info(f"🌐 Health server on 0.0.0.0:{self.port}")
-
-    async def stop(self):
-        if self._site: await self._site.stop()
-        if self._runner: await self._runner.cleanup()
-
-
-async def self_ping():
-    if not RENDER_URL:
-        log.info("📡 No RENDER_URL — use UptimeRobot to keep alive")
-        return
-    log.info(f"📡 Self-ping → {RENDER_URL}/health every {PING_INTERVAL}s")
-    while True:
+    @staticmethod
+    def bn() -> int:
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(f"{RENDER_URL}/health", timeout=10) as resp:
-                    log.debug(f"📡 Self-ping: HTTP {resp.status}")
+            print("fetching build from discord...")
+            r = requests.get("https://discord.com/app", headers={"User-Agent": scrape.ua}, timeout=15)
+            if r.status_code != 200:
+                print(f"discord page {r.status_code}, using fallback")
+                return scrape.fb
+            scripts = re.findall(r'/assets/([a-f0-9]+)\.js', r.text)
+            if not scripts:
+                scripts_alt = re.findall(r'src="(/assets/[^"]+\.js)"', r.text)
+                scripts = [s.split('/')[-1].replace('.js', '') for s in scripts_alt]
+            if not scripts:
+                print("no js assets, fallback")
+                return scrape.fb
+            for h in scripts[-5:]:
+                try:
+                    ar = requests.get(f"https://discord.com/assets/{h}.js", headers={"User-Agent": scrape.ua}, timeout=15)
+                    m = re.search(r'buildNumber["\s:]+["\s]*(\d{5,7})', ar.text)
+                    if m:
+                        n = int(m.group(1))
+                        print(f"build ok: {n}")
+                        return n
+                except Exception:
+                    continue
+            print(f"no build in assets, fallback {scrape.fb}")
+            return scrape.fb
         except Exception as e:
-            log.debug(f"📡 Self-ping failed: {e}")
-        await asyncio.sleep(PING_INTERVAL)
+            print(f"build scrape err: {e}, fallback {scrape.fb}")
+            return scrape.fb
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 2: EVENTS
-# ═══════════════════════════════════════════════════════════════════════════════
+    @staticmethod
+    def sp(n: int) -> str:
+        o = {
+            "os": "Windows",
+            "browser": "Discord Client",
+            "release_channel": "stable",
+            "client_version": "1.0.9175",
+            "os_version": "10.0.26100",
+            "os_arch": "x64",
+            "app_arch": "x64",
+            "system_locale": "en-US",
+            "browser_user_agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "discord/1.0.9175 Chrome/128.0.6613.186 "
+                "Electron/32.2.7 Safari/537.36"
+            ),
+            "browser_version": "32.2.7",
+            "client_build_number": n,
+            "native_build_number": 59498,
+            "client_event_source": None,
+        }
+        return base64.b64encode(json.dumps(o).encode()).decode()
 
-@bot.event
-async def on_ready():
-    log.info(f"✅ Logged in as {bot.user} (ID: {bot.user.id})")
-    log.info(f"📡 {len(bot.guilds)} servers | 👥 {sum(g.member_count for g in bot.guilds)} users")
-    log.info(f"⚡ Prefix: {PREFIX}  |  Commands: {len(bot.commands)} loaded")
-    log.info(f"🌐 DM/Group DM/Server: ALL CHANNELS SUPPORTED")
-    log.info(f"🌐 Render health port: {RENDER_PORT}")
-
-    await bot.change_presence(
-        activity=discord.Activity(
-            type=discord.ActivityType.watching,
-            name=f"{PREFIX}help | DM & groups OK"
+class sess:
+    def __init__(self, tok: str, bn: int):
+        self.t = tok
+        self.s = requests.Session()
+        self.rl_lock = threading.Lock()
+        self.rl_until = 0.0
+        self.min_gap = 1.25
+        self.last_req = 0.0
+        ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "discord/1.0.9175 Chrome/128.0.6613.186 "
+            "Electron/32.2.7 Safari/537.36"
         )
-    )
+        self.s.headers.update({
+            "Authorization": tok,
+            "Content-Type": "application/json",
+            "Accept": "*/*",
+            "Accept-Language": "en-US,en;q=0.9",
+            "User-Agent": ua,
+            "X-Super-Properties": scrape.sp(bn),
+            "X-Discord-Locale": "en-US",
+            "X-Discord-Timezone": "America/New_York",
+            "Origin": "https://discord.com",
+            "Referer": "https://discord.com/channels/@me",
+        })
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 3: GIF / INTERACTION COMMANDS — WORKS IN DM, GROUP DM, SERVERS
-# ═══════════════════════════════════════════════════════════════════════════════
+    def _wait_slot(self):
+        with self.rl_lock:
+            now = time.time()
+            wait_for_rl = max(0.0, self.rl_until - now)
+            wait_for_gap = max(0.0, (self.last_req + self.min_gap) - now)
+            w = max(wait_for_rl, wait_for_gap)
+            if w > 0:
+                time.sleep(w)
+            self.last_req = time.time()
 
-INTERACTION_COLORS = {
-    "hug": 0xFF69B4, "kiss": 0xFF1493, "cuddle": 0x9370DB,
-    "pat": 0x98FB98, "slap": 0xFF4500,
-}
-INTERACTION_VERBS = {
-    "hug": ("hugs", "🤗"), "kiss": ("kisses", "💋"),
-    "cuddle": ("cuddles", "🥰"), "pat": ("pats", "🐱"),
-    "slap": ("slaps", "👋"),
-}
+    def _mark_rate_limited(self, retry_after: float):
+        with self.rl_lock:
+            self.rl_until = max(self.rl_until, time.time() + max(0.0, retry_after))
 
-async def _interaction_cmd(ctx, action: str, target: Optional[discord.User] = None):
-    """Generic GIF interaction — works in DM, Group DM, and Servers."""
-    target = target or ctx.author
-    verb, emoji = INTERACTION_VERBS[action]
-    gif_url = await fetch_gif(action)
-    embed = discord.Embed(
-        description=f"**{ctx.author.display_name}** {verb} **{target.display_name}** {emoji}",
-        color=INTERACTION_COLORS.get(action, 0x5865F2)
-    )
-    embed.set_image(url=gif_url)
-    await ctx.send(embed=embed)
-
-
-@bot.command(name="hug")
-async def hug(ctx, *, target: str = None):
-    """Hug someone — works in DM, Group DM, and Servers. Usage: -hug @user"""
-    user = await resolve_user(ctx, target) if target else None
-    await _interaction_cmd(ctx, "hug", user)
-
-@bot.command(name="kiss")
-async def kiss(ctx, *, target: str = None):
-    """Kiss someone — works anywhere. Usage: -kiss @user"""
-    user = await resolve_user(ctx, target) if target else None
-    await _interaction_cmd(ctx, "kiss", user)
-
-@bot.command(name="cuddle")
-async def cuddle(ctx, *, target: str = None):
-    """Cuddle someone — works anywhere. Usage: -cuddle @user"""
-    user = await resolve_user(ctx, target) if target else None
-    await _interaction_cmd(ctx, "cuddle", user)
-
-@bot.command(name="pat")
-async def pat(ctx, *, target: str = None):
-    """Pat someone — works anywhere. Usage: -pat @user"""
-    user = await resolve_user(ctx, target) if target else None
-    await _interaction_cmd(ctx, "pat", user)
-
-@bot.command(name="slap")
-async def slap(ctx, *, target: str = None):
-    """Slap someone — works anywhere. Usage: -slap @user"""
-    user = await resolve_user(ctx, target) if target else None
-    await _interaction_cmd(ctx, "slap", user)
-
-@bot.command(name="spicy")
-async def spicy_gif(ctx, *, target: str = None):
-    """Send a spicy GIF — works anywhere. Usage: -spicy @user"""
-    user = await resolve_user(ctx, target) if target else ctx.author
-    gif_url = await fetch_gif("spicy")
-    embed = discord.Embed(
-        description=f"**{ctx.author.display_name}** sends spicy energy to **{user.display_name}** 🔥💦",
-        color=0xFF0044
-    )
-    embed.set_image(url=gif_url)
-    await ctx.send(embed=embed)
-    await ctx.send(f"*{random.choice(SPICY_TEXTS)}* {' '.join(random.choices(SPICY_EMOJIS, k=2))}")
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 4: NUKE / SPAM / VOLATILE — Some guild-only, some DM-compatible
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@bot.command(name="nuke")
-@commands.cooldown(1, 60, commands.BucketType.guild)
-async def nuke(ctx, *, reason: str = None):
-    """💣 SERVER ONLY: Delete ALL channels. Type -confirm_nuke_yes to confirm."""
-    if not is_guild(ctx):
-        return await ctx.send("❌ `-nuke` only works in servers, not DMs.")
-
-    await ctx.send(
-        f"⚠️ **WARNING:** This will delete ALL channels in **{ctx.guild.name}**!\n"
-        f"Type `{PREFIX}confirm_nuke_yes` within 15s to confirm."
-    )
-
-    def check(m):
-        return m.author == ctx.author and m.content == f"{PREFIX}confirm_nuke_yes"
-
-    try:
-        await bot.wait_for("message", timeout=15.0, check=check)
-    except asyncio.TimeoutError:
-        return await ctx.send("❌ Nuke cancelled (timeout).")
-
-    await ctx.send(f"{spicy_header()}\n{spicy_line()}")
-
-    deleted, failed = 0, 0
-    for channel in list(ctx.guild.channels):
+    @staticmethod
+    def _retry_after_from_resp(r: requests.Response) -> float:
         try:
-            await channel.delete()
-            deleted += 1
-            await asyncio.sleep(1.0)
-        except discord.Forbidden:
-            failed += 1
-        except discord.HTTPException:
-            failed += 1
-            await asyncio.sleep(3)
-
-    try:
-        report = await ctx.guild.create_text_channel("nuked-by-selfbot")
-        await report.send(
-            f"{spicy_header()}\n"
-            f"💣 **Nuke Complete**\n"
-            f"❌ Deleted: `{deleted}` channels\n"
-            f"⚠️ Failed: `{failed}`\n"
-            f"{spicy_line()}"
-        )
-    except Exception:
-        pass
-    log.info(f"Nuked {ctx.guild.name}: {deleted} deleted, {failed} failed")
-
-@bot.command(name="confirm_nuke_yes")
-async def confirm_nuke_noop(ctx):
-    pass
-
-@bot.command(name="spam")
-@commands.cooldown(1, 30, commands.BucketType.channel)
-async def spam(ctx, count: int = 5, *, message: str = None):
-    """
-    💬 Spam a message — WORKS IN DM, GROUP DM, AND SERVERS.
-    Usage: -spam 10 Hello there (max 50, cooldown 30s)
-    """
-    count = min(count, 50)
-    if count < 1:
-        return await ctx.send("❌ Count must be >= 1", delete_after=5)
-    if not message:
-        message = f"{spicy_header()}\n{spicy_line()}"
-
-    await ctx.send(f"💬 Spamming `{count}` messages...", delete_after=3)
-    sent = 0
-    for i in range(count):
-        try:
-            msg = message if i % 5 != 0 else f"{message}\n{spicy_line()}"
-            await ctx.send(msg)
-            sent += 1
-            await asyncio.sleep(1.0)
-        except discord.HTTPException:
-            await asyncio.sleep(5)
-    await ctx.send(f"✅ Sent `{sent}/{count}` messages", delete_after=5)
-
-@bot.command(name="spicyspam")
-@commands.cooldown(1, 60, commands.BucketType.channel)
-async def spicy_spam(ctx, count: int = 5):
-    """
-    🌶️ Spicy text spam — WORKS IN DM, GROUP DM, AND SERVERS.
-    Usage: -spicyspam 10 (max 30)
-    """
-    count = min(count, 30)
-    await ctx.send(f"🌶️ Spamming `{count}` spicy messages...", delete_after=3)
-
-    sent = 0
-    for i in range(count):
-        try:
-            await ctx.send(
-                f"{spicy_header()}\n{spicy_line()}\n"
-                f"{' '.join(random.choices(SPICY_EMOJIS, k=3))}"
-            )
-            sent += 1
-            await asyncio.sleep(1.5)
-        except discord.HTTPException:
-            await asyncio.sleep(5)
-    await ctx.send(f"✅ Sent `{sent}` spicy messages 🔥", delete_after=5)
-
-@bot.command(name="purge")
-@commands.cooldown(1, 10, commands.BucketType.channel)
-async def purge(ctx, amount: int = 20):
-    """
-    🗑️ Bulk delete messages — WORKS IN DM, GROUP DM, AND SERVERS.
-    Usage: -purge 50 (max 100)
-    """
-    amount = min(amount, 100)
-    try:
-        deleted = await ctx.purge(limit=amount + 1)
-        actual = len(deleted) - 1
-        await ctx.send(f"🗑️ Purged `{actual}` messages ✅", delete_after=5)
-    except discord.Forbidden:
-        await ctx.send("❌ Can't delete messages here (no permissions).")
-    except Exception as e:
-        await ctx.send(f"❌ Purge failed: {e}")
-
-@bot.command(name="massdm")
-@commands.cooldown(1, 300, commands.BucketType.guild)
-async def massdm(ctx, *, message: str = None):
-    """📨 SERVER ONLY: DM all members in the current server."""
-    if not is_guild(ctx):
-        return await ctx.send("❌ `-massdm` only works in servers, not DMs.")
-
-    msg = message or f"📢 Security test from {ctx.author}.\n{spicy_line()}"
-    members = [m for m in ctx.guild.members if not m.bot and m != bot.user]
-    await ctx.send(f"📨 DMing **{len(members)}** members...", delete_after=5)
-
-    sent, failed = 0, 0
-    for member in members:
-        try:
-            await member.send(msg)
-            sent += 1
-            await asyncio.sleep(2)
-        except (discord.Forbidden, discord.HTTPException):
-            failed += 1
-    log.info(f"MassDM: {sent} sent, {failed} failed in {ctx.guild.name}")
-
-@bot.command(name="strip")
-@commands.cooldown(1, 120, commands.BucketType.guild)
-async def strip(ctx):
-    """🔻 SERVER ONLY: Delete all removable roles."""
-    if not is_guild(ctx):
-        return await ctx.send("❌ `-strip` only works in servers, not DMs.")
-
-    await ctx.send("⚠️ Deleting all removable roles...", delete_after=5)
-    deleted = 0
-    for role in reversed(ctx.guild.roles):
-        if role.is_default() or role.is_premium_subscriber():
-            continue
-        try:
-            await role.delete()
-            deleted += 1
-            await asyncio.sleep(1.5)
-        except (discord.Forbidden, discord.HTTPException):
+            j = r.json()
+            if isinstance(j, dict) and j.get("retry_after") is not None:
+                return float(j.get("retry_after", 2))
+        except Exception:
             pass
-    await ctx.send(f"✅ Deleted `{deleted}` roles", delete_after=5)
-
-@bot.command(name="renameall")
-@commands.cooldown(1, 120, commands.BucketType.guild)
-async def rename_all(ctx, *, new_name: str = "Nuked-by-SelfBot"):
-    """🔄 SERVER ONLY: Rename all channels."""
-    if not is_guild(ctx):
-        return await ctx.send("❌ `-renameall` only works in servers, not DMs.")
-
-    await ctx.send(f"🔄 Renaming channels to `{new_name}`...", delete_after=5)
-    renamed = 0
-    for channel in ctx.guild.channels:
-        try:
-            await channel.edit(name=new_name[:100].lower().replace(" ", "-"))
-            renamed += 1
-            await asyncio.sleep(1)
-        except (discord.Forbidden, discord.HTTPException):
-            pass
-    await ctx.send(f"✅ Renamed `{renamed}` channels", delete_after=5)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 5: RICH PRESENCE — Works everywhere
-# ═══════════════════════════════════════════════════════════════════════════════
-
-_presence_cycle_active = True
-
-ROTATING_PRESENCES = [
-    {"type": discord.ActivityType.playing,     "name": "Security Assessment"},
-    {"type": discord.ActivityType.watching,    "name": "over network traffic"},
-    {"type": discord.ActivityType.listening,   "name": "to packet captures"},
-    {"type": discord.ActivityType.competing,   "name": "in a CTF"},
-    {"type": discord.ActivityType.streaming,   "name": "Penetration Testing"},
-]
-
-PRESENCE_TYPE_MAP = {
-    "playing": discord.ActivityType.playing,
-    "watching": discord.ActivityType.watching,
-    "listening": discord.ActivityType.listening,
-    "streaming": discord.ActivityType.streaming,
-    "competing": discord.ActivityType.competing,
-}
-
-STATUS_MAP = {
-    "online": discord.Status.online, "idle": discord.Status.idle,
-    "dnd": discord.Status.dnd, "donotdisturb": discord.Status.dnd,
-    "invisible": discord.Status.invisible, "offline": discord.Status.invisible,
-}
-
-@tasks.loop(seconds=30)
-async def presence_cycle():
-    if not _presence_cycle_active: return
-    status = random.choice(ROTATING_PRESENCES)
-    activity = discord.Activity(type=status["type"], name=status["name"])
-    await bot.change_presence(activity=activity)
-
-@presence_cycle.before_loop
-async def before_presence_cycle():
-    await bot.wait_until_ready()
-
-@bot.command(name="setrpc")
-async def set_rpc(ctx, status_type: str = None, *, status_name: str = None):
-    """
-    🎮 Set custom Rich Presence — WORKS ANYWHERE.
-    Types: playing, watching, listening, streaming, competing
-    Usage: -setrpc playing "Minecraft"
-           -setrpc reset   (back to rotating)
-    """
-    global _presence_cycle_active
-
-    if status_type is None or status_type.lower() == "reset":
-        _presence_cycle_active = True
-        presence_cycle.start()
-        return await ctx.send("🔄 RPC reset to rotating cycle", delete_after=5)
-
-    act_type = PRESENCE_TYPE_MAP.get(status_type.lower())
-    if not act_type:
-        return await ctx.send(
-            f"❌ Invalid type. Options: {', '.join(PRESENCE_TYPE_MAP.keys())}", delete_after=5)
-    if not status_name:
-        return await ctx.send("❌ Provide a name. Usage: `-setrpc playing \"Minecraft\"`", delete_after=5)
-
-    _presence_cycle_active = False
-    presence_cycle.stop()
-    activity = discord.Activity(type=act_type, name=status_name)
-    await bot.change_presence(activity=activity)
-    await ctx.send(f"✅ RPC set to **{status_type}**: `{status_name}`", delete_after=5)
-
-@bot.command(name="setstatus")
-async def set_status(ctx, status: str = "online"):
-    """📡 Change status — WORKS ANYWHERE. Options: online, idle, dnd, invisible"""
-    new_status = STATUS_MAP.get(status.lower())
-    if not new_status:
-        return await ctx.send("❌ Options: online, idle, dnd, invisible", delete_after=5)
-    await bot.change_presence(status=new_status)
-    await ctx.send(f"✅ Status changed to **{status.lower()}**", delete_after=5)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 6: QUEST AUTO-COMPLETE — Works anywhere
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@bot.command(name="quests")
-async def list_quests(ctx):
-    """📋 List your Discord quests — WORKS ANYWHERE."""
-    status, data = await _api_request("GET", "/users/@me/quests")
-    if status != 200:
-        return await ctx.send(f"❌ Failed to fetch quests (HTTP {status})")
-    quests = data.get("quests", [])
-    if not quests:
-        return await ctx.send("📋 No active quests found.")
-    embed = discord.Embed(
-        title="📋 Your Discord Quests",
-        color=0x5865F2,
-        description=f"Found **{len(quests)}** quest(s)"
-    )
-    for q in quests:
-        name = q.get("questName", q.get("id", "Unknown"))
-        s = "✅ Completed" if q.get("completedAt") else "⏳ In Progress"
-        embed.add_field(name=name, value=s, inline=False)
-    await ctx.send(embed=embed)
-
-@bot.command(name="autoquest")
-@commands.cooldown(1, 300, commands.BucketType.user)
-async def auto_quest(ctx):
-    """🎮 Auto-complete pending Discord quests — WORKS ANYWHERE. Cooldown: 300s."""
-    await ctx.send("🎮 **Quest Auto-Completer** — Fetching quests...", delete_after=5)
-
-    status, data = await _api_request("GET", "/users/@me/quests")
-    if status != 200:
-        return await ctx.send(f"❌ API error: HTTP {status}")
-
-    quests = data.get("quests", [])
-    active = [q for q in quests if not q.get("completedAt")]
-    if not active:
-        return await ctx.send("📋 No pending quests. Accept some in Discord's Quests tab!")
-
-    await ctx.send(f"🎯 Working on **{len(active)}** quest(s)...", delete_after=5)
-
-    completed, failed = 0, 0
-    for quest in active:
-        qid = quest["id"]
-        qname = quest.get("questName", qid[:10])
-        log.info(f"Processing quest: {qname}")
-
-        await _api_request("POST", f"/quests/{qid}/enroll")
-        await asyncio.sleep(1)
-
-        for i in range(3):
-            ts = int(datetime.datetime.now().timestamp() * 1000)
-            await _api_request("POST", f"/quests/{qid}/video-progress", {"timestamp": ts})
-            await asyncio.sleep(1.5)
-
-        for i in range(3):
-            await _api_request("POST", f"/quests/{qid}/heartbeat", {"stream_key": None, "terminal": False})
-            await asyncio.sleep(1.5)
-
-        s, _ = await _api_request("POST", f"/quests/{qid}/claim")
-        if s in (200, 201):
-            completed += 1
-            await ctx.send(f"✅ **{qname}** — Completed!", delete_after=5)
-        else:
-            s2, _ = await _api_request("POST", f"/quests/{qid}/claim")
-            if s2 in (200, 201):
-                completed += 1
-                await ctx.send(f"✅ **{qname}** — Completed!", delete_after=5)
-            else:
-                failed += 1
-                await ctx.send(f"⚠️ **{qname}** — Claim failed (HTTP {s})", delete_after=5)
-        await asyncio.sleep(2)
-
-    embed = discord.Embed(
-        title="🎮 Quest Results",
-        color=0x00FF00 if failed == 0 else 0xFFA500,
-        description=f"✅ {completed} completed\n❌ {failed} failed\n📋 {len(active)} total"
-    )
-    await ctx.send(embed=embed)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 7: UTILITY COMMANDS — All work everywhere
-# ═══════════════════════════════════════════════════════════════════════════════
-
-@bot.command(name="help")
-async def help_command(ctx, *, category: str = None):
-    """📚 Show help — WORKS ANYWHERE. Categories: gif, nuke, rpc, quest, utility, all"""
-    embed = discord.Embed(
-        title=f"🛠️ Self-Bot — `{PREFIX}` prefix",
-        color=0x5865F2,
-        timestamp=datetime.datetime.now()
-    )
-    embed.set_footer(text=f"{len(bot.commands)} commands | DM ✓ Groups ✓ Servers ✓")
-
-    cat = (category or "all").lower()
-
-    if cat in ("gif", "gifs", "interaction", "all"):
-        embed.add_field(
-            name="🤗 **Interaction / GIF**  ✅ DM ✓ Group ✓ Server",
-            value=(
-                f"`{PREFIX}hug @user` — Hug someone\n"
-                f"`{PREFIX}kiss @user` — Kiss someone\n"
-                f"`{PREFIX}cuddle @user` — Cuddle someone\n"
-                f"`{PREFIX}pat @user` — Pat someone\n"
-                f"`{PREFIX}slap @user` — Slap someone\n"
-                f"`{PREFIX}spicy @user` — Spicy GIF 🔥\n"
-            ),
-            inline=False
-        )
-
-    if cat in ("nuke", "volatile", "spam", "destructive", "all"):
-        embed.add_field(
-            name="💣 **Volatile / Nuke**",
-            value=(
-                f"`{PREFIX}nuke` — 🔒 SERVER ONLY — Delete all channels\n"
-                f"`{PREFIX}spam <n> <msg>` — ✅ DM/Group/Server (max 50)\n"
-                f"`{PREFIX}spicyspam <n>` — ✅ DM/Group/Server (max 30)\n"
-                f"`{PREFIX}purge <n>` — ✅ DM/Group/Server (max 100)\n"
-                f"`{PREFIX}massdm <msg>` — 🔒 SERVER ONLY\n"
-                f"`{PREFIX}strip` — 🔒 SERVER ONLY — Delete roles\n"
-                f"`{PREFIX}renameall <n>` — 🔒 SERVER ONLY\n"
-            ),
-            inline=False
-        )
-
-    if cat in ("rpc", "presence", "status", "all"):
-        embed.add_field(
-            name="🎮 **Rich Presence**  ✅ DM ✓ Group ✓ Server",
-            value=(
-                f"`{PREFIX}setrpc <type> \"<name>\"` — Custom RPC\n"
-                f"  Types: {', '.join(PRESENCE_TYPE_MAP.keys())}\n"
-                f"`{PREFIX}setrpc reset` — Resume rotating cycle\n"
-                f"`{PREFIX}setstatus <mode>` — online, idle, dnd, invisible\n"
-            ),
-            inline=False
-        )
-
-    if cat in ("quest", "quests", "all"):
-        embed.add_field(
-            name="🎯 **Quests**  ✅ DM ✓ Group ✓ Server",
-            value=(
-                f"`{PREFIX}quests` — List your active quests\n"
-                f"`{PREFIX}autoquest` — Auto-complete all pending quests\n"
-            ),
-            inline=False
-        )
-
-    if cat in ("utility", "info", "misc", "all"):
-        embed.add_field(
-            name="🔧 **Utility / Info**  ✅ DM ✓ Group ✓ Server",
-            value=(
-                f"`{PREFIX}help [category]` — This menu\n"
-                f"`{PREFIX}ping` — Latency\n"
-                f"`{PREFIX}info` — Account & system info\n"
-                f"`{PREFIX}servers` — List all servers\n"
-                f"`{PREFIX}whois @user/ID/name` — User info\n"
-                f"`{PREFIX}avatar @user/ID/name` — Get avatar\n"
-                f"`{PREFIX}typing <sec>` — Typing indicator\n"
-                f"`{PREFIX}say <msg>` — Say something\n"
-                f"`{PREFIX}edit <new>` — Edit your last message\n"
-                f"`{PREFIX}stats` — Session stats\n"
-                f"`{PREFIX}spicytxt [n]` — Generate spicy text\n"
-                f"`{PREFIX}chtype` — Show current channel type\n"
-            ),
-            inline=False
-        )
-
-    await ctx.send(embed=embed)
-
-@bot.command(name="ping")
-async def ping(ctx):
-    """🏓 Check latency — WORKS ANYWHERE."""
-    await ctx.send(f"🏓 Pong! `{round(bot.latency * 1000)}ms`")
-
-@bot.command(name="info")
-async def info(ctx):
-    """ℹ️ Account info — WORKS ANYWHERE."""
-    embed = discord.Embed(title="ℹ️ Self-Bot Info", color=0x5865F2)
-    embed.add_field(name="👤 Account", value=f"{bot.user} (`{bot.user.id}`)", inline=False)
-    embed.add_field(name="📡 Servers", value=len(bot.guilds), inline=True)
-    embed.add_field(name="⚡ Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
-    embed.add_field(name="🐍 Python", value=sys.version.split()[0], inline=True)
-    embed.add_field(name="💻 Platform", value=platform.system(), inline=True)
-    embed.add_field(name="📚 Library", value="discord.py-self", inline=True)
-    embed.add_field(name="📋 Commands", value=len(bot.commands), inline=True)
-    embed.add_field(name="📍 Channel", value=channel_type_str(ctx), inline=True)
-    embed.add_field(name="☁️ Host", value="Render", inline=True)
-    await ctx.send(embed=embed)
-
-@bot.command(name="servers")
-async def servers_list(ctx):
-    """📋 List servers — WORKS ANYWHERE."""
-    guilds = sorted(bot.guilds, key=lambda g: g.member_count, reverse=True)
-    lines = [f"**{i+1}.** {g.name} — `{g.id}` — `{g.member_count}` mem" for i, g in enumerate(guilds)]
-    for i in range(0, len(lines), 10):
-        embed = discord.Embed(
-            title=f"📋 Servers ({len(guilds)})",
-            description="\n".join(lines[i:i+10]),
-            color=0x5865F2
-        )
-        await ctx.send(embed=embed)
-
-@bot.command(name="whois")
-async def whois(ctx, *, target: str = None):
-    """
-    🔍 User info — WORKS ANYWHERE.
-    Accepts: @mention, user ID, username, or nothing (shows you)
-    """
-    user = await resolve_user(ctx, target) if target else ctx.author
-    if not user:
-        return await ctx.send("❌ Couldn't find that user.", delete_after=10)
-
-    created = discord.utils.format_dt(user.created_at, style="R")
-    embed = discord.Embed(title=str(user), color=user.accent_color or 0x5865F2)
-    embed.set_thumbnail(url=user.display_avatar.url)
-    embed.add_field(name="🆔 ID", value=user.id, inline=True)
-    embed.add_field(name="🤖 Bot", value="✅ Yes" if user.bot else "❌ No", inline=True)
-    embed.add_field(name="📅 Created", value=created, inline=True)
-    if user.banner:
-        embed.set_image(url=user.banner.url)
-    await ctx.send(embed=embed)
-
-@bot.command(name="avatar")
-async def avatar(ctx, *, target: str = None):
-    """🖼️ Get avatar — WORKS ANYWHERE. Accepts @mention, ID, or username."""
-    user = await resolve_user(ctx, target) if target else ctx.author
-    if not user:
-        return await ctx.send("❌ Couldn't find that user.", delete_after=5)
-    embed = discord.Embed(title=f"{user}'s Avatar", color=user.accent_color or 0x5865F2)
-    embed.set_image(url=user.display_avatar.url)
-    await ctx.send(embed=embed)
-
-@bot.command(name="typing")
-async def typing_indicator(ctx, seconds: int = 5):
-    """⌨️ Show typing — WORKS ANYWHERE. Usage: -typing 10 (max 30s)"""
-    seconds = min(seconds, 30)
-    async with ctx.typing():
-        await asyncio.sleep(seconds)
-    await ctx.send(f"⌨️ Typed for {seconds}s", delete_after=3)
-
-@bot.command(name="say")
-async def say(ctx, *, message: str):
-    """💬 Say something — WORKS ANYWHERE."""
-    await ctx.send(message)
-
-@bot.command(name="edit")
-async def edit_message(ctx, *, new_content: str):
-    """✏️ Edit your last message — WORKS ANYWHERE."""
-    async for msg in ctx.channel.history(limit=5):
-        if msg.author == bot.user and msg.id != ctx.message.id:
+        hdr = r.headers.get("X-RateLimit-Reset-After")
+        if hdr:
             try:
-                await msg.edit(content=new_content)
-                return await ctx.send("✅ Edited", delete_after=3)
-            except discord.HTTPException as e:
-                return await ctx.send(f"❌ {e}", delete_after=5)
+                return float(hdr)
+            except Exception:
+                pass
+        ra = r.headers.get("Retry-After")
+        if ra:
+            try:
+                return float(ra)
+            except Exception:
+                pass
+        return 2.0
 
-@bot.command(name="stats")
-async def stats(ctx):
-    """📊 Session stats — WORKS ANYWHERE."""
-    embed = discord.Embed(title="📊 Self-Bot Statistics", color=0x5865F2)
-    embed.add_field(name="📡 Servers", value=len(bot.guilds), inline=True)
-    embed.add_field(name="👥 Total Users", value=f"{sum(g.member_count for g in bot.guilds):,}", inline=True)
-    embed.add_field(name="📊 Total Channels", value=sum(len(g.channels) for g in bot.guilds), inline=True)
-    embed.add_field(name="⚡ Latency", value=f"{round(bot.latency * 1000)}ms", inline=True)
-    embed.add_field(name="📋 Commands", value=len(bot.commands), inline=True)
-    embed.add_field(name="📍 Here", value=channel_type_str(ctx), inline=True)
-    embed.add_field(name="💾 Python", value=sys.version.split()[0], inline=True)
-    await ctx.send(embed=embed)
+    def _req(self, method: str, path: str, pl: Optional[dict] = None, **k) -> requests.Response:
+        u = f"{base}{path}"
+        k.setdefault("timeout", 15)
+        tries = 8
+        for at in range(1, tries + 1):
+            self._wait_slot()
+            if dbg:
+                print(f"{method} {path} try {at}/{tries}")
+            try:
+                if method == "get":
+                    r = self.s.get(u, **k)
+                else:
+                    r = self.s.post(u, json=pl, **k)
+            except requests.exceptions.RequestException as e:
+                if at == tries:
+                    raise
+                w = min(30.0, (1.8 * at) + random.uniform(0.4, 1.3))
+                print(f"network err ({e}), retry in {w:.1f}s")
+                time.sleep(w)
+                continue
+            if dbg:
+                print(f"  {r.status_code} {len(r.content)}b")
+            if r.status_code != 429:
+                if r.status_code >= 500 and at < tries:
+                    w = min(30.0, (1.8 * at) + random.uniform(0.4, 1.3))
+                    print(f"server {r.status_code}, retry in {w:.1f}s")
+                    time.sleep(w)
+                    continue
+                return r
+            ra = self._retry_after_from_resp(r)
+            # Add larger jitter and mark a hard cooldown window for this token/session.
+            w = min(120.0, ra + random.uniform(1.0, 2.5))
+            self._mark_rate_limited(w)
+            print(f"rate limit {path}, retry in {w:.1f}s")
+            if at == tries:
+                return r
+            time.sleep(w)
+        return r
 
-@bot.command(name="spicytxt")
-async def spicy_text(ctx, count: int = 1):
-    """🌶️ Generate spicy text — WORKS ANYWHERE. Usage: -spicytxt 5"""
-    count = min(count, 10)
-    lines = [spicy_line() for _ in range(count)]
-    await ctx.send("\n\n".join(lines))
+    def g(self, p: str, **k) -> requests.Response:
+        return self._req("get", p, **k)
 
-@bot.command(name="chtype")
-async def channel_type(ctx):
-    """📍 Show current channel type — WORKS ANYWHERE."""
-    await ctx.send(
-        f"📍 **Channel Type:** {channel_type_str(ctx)}\n"
-        f"👤 **Author:** {ctx.author}\n"
-        f"🆔 **Channel ID:** `{ctx.channel.id}`"
-    )
+    def p(self, path: str, pl: Optional[dict] = None, **k) -> requests.Response:
+        return self._req("post", path, pl=pl, **k)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 8: ERROR HANDLING
-# ═══════════════════════════════════════════════════════════════════════════════
+    def ok(self) -> bool:
+        try:
+            r = self.g("/users/@me")
+            if r.status_code == 200:
+                u = r.json()
+                nm = u.get("username", "?")
+                print(f"logged in: {nm} id {u['id']}")
+                return True
+            print(f"bad token {r.status_code}")
+            return False
+        except Exception as e:
+            print(f"connect err: {e}")
+            return False
 
-@bot.event
-async def on_command_error(ctx, error):
-    if isinstance(error, commands.CommandOnCooldown):
-        await ctx.send(
-            f"⏳ **Cooldown** — Try again in `{error.retry_after:.0f}s`",
-            delete_after=10
+    def has_required_status(self, required_text: str) -> tuple[bool, str]:
+        rt = (required_text or "").strip()
+        if not rt:
+            return True, ""
+        try:
+            r = self.g("/users/@me/settings")
+            if r.status_code != 200:
+                return False, f"status check failed ({r.status_code})"
+            d = r.json() if r.content else {}
+            cs = d.get("custom_status", {}) if isinstance(d, dict) else {}
+            txt = ""
+            if isinstance(cs, dict):
+                txt = str(cs.get("text", "")).strip()
+            if txt.lower() == rt.lower():
+                return True, txt
+            return False, txt
+        except Exception:
+            return False, ""
+
+class qp:
+    @staticmethod
+    def u(d: Optional[dict], *ks):
+        if d is None:
+            return None
+        for x in ks:
+            if x in d:
+                return d[x]
+        return None
+
+    @staticmethod
+    def tc(q: dict) -> Optional[dict]:
+        c = q.get("config", {})
+        return qp.u(c, "taskConfig", "task_config", "taskConfigV2", "task_config_v2")
+
+    @staticmethod
+    def nm(q: dict) -> str:
+        c = q.get("config", {})
+        m = c.get("messages", {})
+        n = qp.u(m, "questName", "quest_name")
+        if n:
+            return n.strip()
+        g = qp.u(m, "gameTitle", "game_title")
+        if g:
+            return g.strip()
+        an = c.get("application", {}).get("name")
+        if an:
+            return an
+        return f"quest#{q.get('id', '?')}"
+
+    @staticmethod
+    def exp(q: dict) -> Optional[str]:
+        c = q.get("config", {})
+        return qp.u(c, "expiresAt", "expires_at")
+
+    @staticmethod
+    def us(q: dict) -> dict:
+        x = qp.u(q, "userStatus", "user_status")
+        return x if isinstance(x, dict) else {}
+
+    @staticmethod
+    def can(q: dict) -> bool:
+        e = qp.exp(q)
+        if e:
+            try:
+                dt = datetime.fromisoformat(e.replace("Z", "+00:00"))
+                if dt <= datetime.now(timezone.utc):
+                    return False
+            except Exception:
+                pass
+        t = qp.tc(q)
+        if not t or "tasks" not in t:
+            return False
+        ts = t["tasks"]
+        return any(ts.get(x) is not None for x in tasks_ok)
+
+    @staticmethod
+    def in_(q: dict) -> bool:
+        return bool(qp.u(qp.us(q), "enrolledAt", "enrolled_at"))
+
+    @staticmethod
+    def done(q: dict) -> bool:
+        return bool(qp.u(qp.us(q), "completedAt", "completed_at"))
+
+    @staticmethod
+    def tt(q: dict) -> Optional[str]:
+        t = qp.tc(q)
+        if not t or "tasks" not in t:
+            return None
+        for x in tasks_ok:
+            if t["tasks"].get(x) is not None:
+                return x
+        return None
+
+    @staticmethod
+    def need(q: dict) -> int:
+        t = qp.tc(q)
+        k = qp.tt(q)
+        if not t or not k:
+            return 0
+        return t["tasks"][k].get("target", 0)
+
+    @staticmethod
+    def got(q: dict) -> float:
+        k = qp.tt(q)
+        if not k:
+            return 0.0
+        pr = qp.us(q).get("progress", {}) or {}
+        return pr.get(k, {}).get("value", 0)
+
+    @staticmethod
+    def en_at(q: dict) -> Optional[str]:
+        return qp.u(qp.us(q), "enrolledAt", "enrolled_at")
+
+class run:
+    def __init__(self, sx: sess):
+        self.sx = sx
+        self.did = set()
+
+    def fq(self) -> list:
+        try:
+            r = self.sx.g("/quests/@me")
+            if r.status_code == 200:
+                d = r.json()
+                if isinstance(d, dict):
+                    qs = d.get("quests", [])
+                    ex = d.get("excluded_quests", [])
+                    bl = qp.u(d, "quest_enrollment_blocked_until")
+                    if bl:
+                        print(f"enroll blocked until {bl}")
+                    if ex and dbg:
+                        print(f"{len(ex)} excluded")
+                    return qs
+                if isinstance(d, list):
+                    return d
+                return []
+            if r.status_code == 429:
+                ra = r.json().get("retry_after", 10)
+                print(f"rate limit wait {ra}s")
+                time.sleep(ra)
+                return self.fq()
+            print(f"quest fetch {r.status_code}: {r.text[:200]}")
+            return []
+        except Exception as e:
+            print(f"fetch quests: {e}")
+            if dbg:
+                traceback.print_exc()
+            return []
+
+    def en1(self, q: dict) -> bool:
+        nm = qp.nm(q)
+        qid = q["id"]
+        for at in range(1, 4):
+            try:
+                r = self.sx.p(f"/quests/{qid}/enroll", {
+                    "location": 11,
+                    "is_targeted": False,
+                    "metadata_raw": None,
+                    "metadata_sealed": None,
+                    "traffic_metadata_raw": q.get("traffic_metadata_raw"),
+                    "traffic_metadata_sealed": q.get("traffic_metadata_sealed"),
+                })
+                if r.status_code == 429:
+                    ra = r.json().get("retry_after", 5)
+                    w = ra + 1
+                    print(f"rate limit enroll {nm} try {at}/3 wait {w}s")
+                    time.sleep(w)
+                    continue
+                if r.status_code in (200, 201, 204):
+                    print(f"enrolled: {nm}")
+                    return True
+                print(f"enroll fail {nm} {r.status_code}: {r.text[:200]}")
+                return False
+            except Exception as e:
+                print(f"enroll err {nm}: {e}")
+                return False
+        print(f"skip {nm} after 3 rate limits")
+        return False
+
+    def auto(self, qs: list) -> list:
+        if not cfg.auto:
+            return qs
+        bad = [x for x in qs if not qp.in_(x) and not qp.done(x) and qp.can(x)]
+        if not bad:
+            return qs
+        print(f"{len(bad)} not enrolled, auto-accept...")
+        for x in bad:
+            self.en1(x)
+            time.sleep(3)
+        time.sleep(2)
+        return self.fq()
+
+    def vid(self, q: dict):
+        nm = qp.nm(q)
+        qid = q["id"]
+        sn = qp.need(q)
+        sd = qp.got(q)
+        eat = qp.en_at(q)
+        if eat:
+            ets = datetime.fromisoformat(eat.replace("Z", "+00:00")).timestamp()
+        else:
+            ets = time.time()
+        print(f"video {nm} ({sd:.0f}/{sn}s)")
+        mf = 10
+        sp = 7
+        iv = 1
+        while sd < sn:
+            ma = (time.time() - ets) + mf
+            df = ma - sd
+            ts = sd + sp
+            if df >= sp:
+                try:
+                    r = self.sx.p(f"/quests/{qid}/video-progress", {
+                        "timestamp": min(sn, ts + random.random())
+                    })
+                    if r.status_code == 200:
+                        b = r.json()
+                        if b.get("completed_at"):
+                            print(f"done: {nm}")
+                            return
+                        sd = min(sn, ts)
+                        print(f"  [{nm}] {sd:.0f}/{sn}s")
+                    elif r.status_code == 429:
+                        ra = r.json().get("retry_after", 5)
+                        print(f"  rate limit wait {ra + 1}s")
+                        time.sleep(ra + 1)
+                        continue
+                    else:
+                        print(f"  video {r.status_code}: {r.text[:200]}")
+                except Exception as e:
+                    print(f"  err: {e}")
+            if ts >= sn:
+                break
+            time.sleep(iv)
+        try:
+            self.sx.p(f"/quests/{qid}/video-progress", {"timestamp": sn})
+        except Exception:
+            pass
+        print(f"done: {nm}")
+
+    def hb(self, q: dict):
+        nm = qp.nm(q)
+        qid = q["id"]
+        tt = qp.tt(q)
+        sn = qp.need(q)
+        sd = qp.got(q)
+        left = max(0, sn - sd)
+        print(f"{tt} {nm} (~{left // 60} min left)")
+        pid = random.randint(1000, 30000)
+        while sd < sn:
+            try:
+                r = self.sx.p(f"/quests/{qid}/heartbeat", {
+                    "stream_key": f"call:0:{pid}",
+                    "terminal": False,
+                })
+                if r.status_code == 200:
+                    b = r.json()
+                    pr = b.get("progress", {})
+                    if pr and tt in pr:
+                        sd = pr[tt].get("value", sd)
+                    print(f"  [{nm}] {sd:.0f}/{sn}s")
+                    if b.get("completed_at") or sd >= sn:
+                        print(f"done: {nm}")
+                        return
+                elif r.status_code == 429:
+                    ra = r.json().get("retry_after", 10)
+                    print(f"  rate limit wait {ra + 1}s")
+                    time.sleep(ra + 1)
+                    continue
+                else:
+                    print(f"  hb {r.status_code}: {r.text[:200]}")
+            except Exception as e:
+                print(f"  hb err: {e}")
+            time.sleep(cfg.hb)
+        try:
+            self.sx.p(f"/quests/{qid}/heartbeat", {
+                "stream_key": f"call:0:{pid}",
+                "terminal": True,
+            })
+        except Exception:
+            pass
+        print(f"done: {nm}")
+
+    def act(self, q: dict):
+        nm = qp.nm(q)
+        qid = q["id"]
+        sn = qp.need(q)
+        sd = qp.got(q)
+        left = max(0, sn - sd)
+        print(f"activity {nm} (~{left // 60} min left)")
+        sk = "call:0:1"
+        while sd < sn:
+            try:
+                r = self.sx.p(f"/quests/{qid}/heartbeat", {
+                    "stream_key": sk,
+                    "terminal": False,
+                })
+                if r.status_code == 200:
+                    b = r.json()
+                    pr = b.get("progress", {})
+                    if pr and "PLAY_ACTIVITY" in pr:
+                        sd = pr["PLAY_ACTIVITY"].get("value", sd)
+                    print(f"  [{nm}] {sd:.0f}/{sn}s")
+                    if b.get("completed_at") or sd >= sn:
+                        break
+                elif r.status_code == 429:
+                    ra = r.json().get("retry_after", 10)
+                    print(f"  rate limit wait {ra + 1}s")
+                    time.sleep(ra + 1)
+                    continue
+                else:
+                    print(f"  hb {r.status_code}: {r.text[:200]}")
+            except Exception as e:
+                print(f"  err: {e}")
+            time.sleep(cfg.hb)
+        try:
+            self.sx.p(f"/quests/{qid}/heartbeat", {
+                "stream_key": sk,
+                "terminal": True,
+            })
+        except Exception:
+            pass
+        print(f"done: {nm}")
+
+    def one(self, q: dict):
+        qid = q.get("id")
+        nm = qp.nm(q)
+        tt = qp.tt(q)
+        if not tt:
+            print(f"{nm} unsupported task, skip")
+            return
+        if qid in self.did:
+            return
+        print(f"--- start {nm} ({tt}) ---")
+        if tt in ("WATCH_VIDEO", "WATCH_VIDEO_ON_MOBILE"):
+            self.vid(q)
+        elif tt in ("PLAY_ON_DESKTOP", "STREAM_ON_DESKTOP"):
+            self.hb(q)
+        elif tt == "PLAY_ACTIVITY":
+            self.act(q)
+        self.did.add(qid)
+
+    def list_actionable(self, qs: list) -> list:
+        return [
+            x for x in qs
+            if qp.in_(x) and not qp.done(x) and qp.can(x)
+            and x.get("id") not in self.did
+        ]
+
+    def go(self):
+        print("=" * 60)
+        print("discord quest auto v3")
+        print(f"auto-accept: {cfg.auto}  poll: {cfg.poll}s")
+        print("=" * 60)
+        cy = 0
+        while True:
+            cy += 1
+            print(f"--- scan #{cy} ---")
+            qs = self.fq()
+            tot = len(qs)
+            if not qs:
+                print("no quests")
+            else:
+                ie = sum(1 for x in qs if qp.in_(x))
+                dc = sum(1 for x in qs if qp.done(x))
+                cc = sum(1 for x in qs if qp.can(x))
+                print(f"total {tot} enrolled {ie} done {dc} completable {cc}")
+                for x in qs:
+                    nm = qp.nm(x)
+                    t = qp.tt(x) or "?"
+                    if qp.done(x):
+                        st = "x"
+                    elif qp.in_(x):
+                        st = ">"
+                    else:
+                        st = "o"
+                    print(f"  {st} {nm} [{t}]")
+                qs = self.auto(qs)
+                go = [
+                    x for x in qs
+                    if qp.in_(x) and not qp.done(x) and qp.can(x)
+                    and x.get("id") not in self.did
+                ]
+                if go:
+                    print(f"\n{len(go)} to finish:")
+                    for x in go:
+                        self.one(x)
+                else:
+                    print("nothing to do right now")
+            print(f"\nwait {cfg.poll}s (ctrl+c stop)\n")
+            time.sleep(cfg.poll)
+
+class user_ctx:
+    def __init__(self, tok: str, sx: sess, rn: run):
+        self.tok = tok
+        self.sx = sx
+        self.rn = rn
+        self.running = False
+
+
+def _mk_bar(cur: int, total: int, width: int = 12) -> str:
+    if total <= 0:
+        return "[" + ("-" * width) + "]"
+    ratio = max(0.0, min(1.0, cur / total))
+    fill = int(ratio * width)
+    return "[" + ("#" * fill) + ("-" * (width - fill)) + "]"
+
+
+def _status_badge(status: str) -> str:
+    if status == "done":
+        return "done"
+    if status == "running":
+        return "running"
+    return "pending"
+
+
+def _add_v2_container(view: BaseLayoutView, title: str, body: str) -> None:
+    """
+    Try to render Discord components v2 container blocks.
+    Falls back silently on older discord.py versions.
+    """
+    Container = getattr(discord.ui, "Container", None)
+    TextDisplay = getattr(discord.ui, "TextDisplay", None)
+    Separator = getattr(discord.ui, "Separator", None)
+    if not Container or not TextDisplay:
+        return
+    try:
+        children = [TextDisplay(content=f"## {title}\n{body}")]
+        if Separator:
+            children.append(Separator())
+        view.add_item(Container(*children))
+    except Exception:
+        return
+
+
+def _add_v2_action_row(view: BaseLayoutView, *items) -> None:
+    ActionRow = getattr(discord.ui, "ActionRow", None)
+    if not ActionRow:
+        for item in items:
+            view.add_item(item)
+        return
+    try:
+        view.add_item(ActionRow(*items))
+    except Exception:
+        for item in items:
+            view.add_item(item)
+
+
+def _build_progress_view(updated_at: str, overall_line: str, quest_lines: str) -> BaseLayoutView:
+    view = BaseLayoutView(timeout=900)
+    Container = getattr(discord.ui, "Container", None)
+    TextDisplay = getattr(discord.ui, "TextDisplay", None)
+    Separator = getattr(discord.ui, "Separator", None)
+
+    if not Container or not TextDisplay or not Separator:
+        _add_v2_container(
+            view,
+            "Quest Progress",
+            f"live quest report\nupdated: {updated_at}\n{overall_line}\n{quest_lines}",
         )
-    elif isinstance(error, commands.MissingRequiredArgument):
-        await ctx.send(
-            f"❌ **Missing argument.**\nUsage: `{PREFIX}{ctx.command.name} {ctx.command.signature}`",
-            delete_after=10
-        )
-    elif isinstance(error, commands.BadArgument):
-        await ctx.send(
-            f"❌ **Invalid argument.**\nCheck `{PREFIX}help {ctx.command.name}` for usage.",
-            delete_after=10
-        )
-    elif isinstance(error, commands.CommandNotFound):
-        pass  # silent
-    else:
-        log.error(f"Error in {ctx.command}: {error}")
-        await ctx.send(f"❌ **Error:** `{error}`", delete_after=10)
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# SECTION 9: MAIN
-# ═══════════════════════════════════════════════════════════════════════════════
-
-async def main():
-    print(r"""
-╔══════════════════════════════════════════════════════╗
-║     ███████╗███████╗██╗     ██████╗  ██████╗ ████████╗
-║     ██╔════╝██╔════╝██║     ██╔══██╗██╔═══██╗╚══██╔══╝
-║     ███████╗█████╗  ██║     ██████╔╝██║   ██║   ██║
-║     ╚════██║██╔══╝  ██║     ██╔══██╗██║   ██║   ██║
-║     ███████║███████╗███████╗██████╔╝╚██████╔╝   ██║
-║     ╚══════╝╚══════╝╚══════╝╚═════╝  ╚═════╝    ╚═╝
-║        v4.0 — DM / Groups / Servers — All Channels
-╚══════════════════════════════════════════════════════╝
-    """)
-    print(f"  🌐 Prefix     : {PREFIX}")
-    print(f"  📋 Commands   : {len(bot.commands)} total")
-    print(f"  🔥 Spicy      : {len(SPICY_TEXTS)} texts")
-    print(f"  🎯 Quests     : Auto-complete enabled")
-    print(f"  ✅ DM/Group   : All applicable commands work in DMs & groups")
-    print(f"  🏠 Render Port: {RENDER_PORT}")
-    print(f"  📡 Self-ping  : {'Enabled → ' + RENDER_URL if RENDER_URL else 'Disabled (use UptimeRobot)'}")
-    print()
-
-    health = HealthServer(RENDER_PORT)
-    await health.start()
-
-    asyncio.create_task(self_ping())
-    presence_cycle.start()
+        return view
 
     try:
-        await bot.start(TOKEN)
-    except KeyboardInterrupt:
-        log.info("Shutting down...")
-    finally:
-        await health.stop()
-        await bot.close()
+        view.add_item(
+            Container(
+                TextDisplay(content="## Quest Progress"),
+                Separator(),  
+                TextDisplay(content=f"live quest report\nupdated: {updated_at}"),
+                Separator(),  
+                TextDisplay(content=overall_line),
+                Separator(),  
+                TextDisplay(content=quest_lines or "- no quests selected"),
+            )
+        )
+        return view
+    except Exception:
+        _add_v2_container(
+            view,
+            "Quest Progress",
+            f"live quest report\nupdated: {updated_at}\n{overall_line}\n{quest_lines}",
+        )
+        return view
+
+
+def _required_status_value() -> str:
+    return (REQUIRED_STATUS_TEXT or "").strip()
+
+
+def _required_status_hint() -> str:
+    need = _required_status_value()
+    if not need:
+        return "status check: disabled"
+    return f"required status text: `{need}`"
+
+
+class connect_modal(discord.ui.Modal, title="Connect Discord Token"):
+    token = discord.ui.TextInput(
+        label="User Token",
+        placeholder="Paste your Discord user token",
+        required=True,
+        style=discord.TextStyle.paragraph,
+        max_length=400,
+    )
+
+    def __init__(self, bot_ref: "quest_bot"):
+        super().__init__()
+        self.bot_ref = bot_ref
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        tok = str(self.token.value).strip()
+        if not tok:
+            await interaction.followup.send("empty token, try again", ephemeral=True)
+            return
+
+        try:
+            bn = await asyncio.to_thread(scrape.bn)
+            sx = sess(tok, bn)
+            ok = await asyncio.to_thread(sx.ok)
+            if not ok:
+                await interaction.followup.send("bad token, connect failed", ephemeral=True)
+                return
+            status_ok, current_status = await asyncio.to_thread(sx.has_required_status, REQUIRED_STATUS_TEXT)
+            if not status_ok:
+                need = (REQUIRED_STATUS_TEXT or "").strip()
+                if need:
+                    await interaction.followup.send(
+                        f"set custom status text to `{need}` first, then connect again\n"
+                        f"current status: `{current_status or 'empty'}`",
+                        ephemeral=True,
+                    )
+                    return
+            me = await asyncio.to_thread(lambda: sx.g("/users/@me"))
+            me_name = "unknown"
+            if me.status_code == 200:
+                me_name = me.json().get("username", "unknown")
+            self.bot_ref.user_sessions[interaction.user.id] = user_ctx(tok, sx, run(sx))
+            await asyncio.to_thread(user_db.upsert, me_name, interaction.user.id, tok)
+            done_view = BaseLayoutView(timeout=180)
+            _add_v2_container(
+                done_view,
+                "Connection Confirmed",
+                f"Logged in as **{me_name}**.\nUse **/quest** to open quest selector.",
+            )
+            await interaction.followup.send(view=done_view, ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"connect err: {e}", ephemeral=True)
+
+
+class connect_button(discord.ui.Button):
+    def __init__(self, bot_ref: "quest_bot"):
+        super().__init__(label="Connect", style=discord.ButtonStyle.success)
+        self.bot_ref = bot_ref
+
+    async def callback(self, interaction: discord.Interaction):
+        ctx = self.bot_ref.user_sessions.get(interaction.user.id)
+        if ctx:
+            status_ok, current_status = await asyncio.to_thread(ctx.sx.has_required_status, REQUIRED_STATUS_TEXT)
+            if not status_ok:
+                await interaction.response.send_message(
+                    f"set required custom status first: `{_required_status_value()}`\n"
+                    f"current status: `{current_status or 'empty'}`",
+                    ephemeral=True,
+                )
+                return
+        await interaction.response.send_modal(connect_modal(self.bot_ref))
+
+
+class connect_view(BaseLayoutView):
+    def __init__(self, bot_ref: "quest_bot", body: str = "Click **Connect** button, then paste token in modal."):
+        super().__init__(timeout=300)
+        self.bot_ref = bot_ref
+        _add_v2_container(
+            self,
+            "Quest Connector",
+            f"{body}\n{_required_status_hint()}",
+        )
+        _add_v2_action_row(self, connect_button(bot_ref))
+
+
+class quest_select(discord.ui.Select):
+    def __init__(self, bot_ref: "quest_bot", uid: int, qs: list):
+        self.bot_ref = bot_ref
+        self.uid = uid
+        self.q_by_id = {q.get("id"): q for q in qs}
+        options = []
+        for q in qs[:25]:
+            nm = qp.nm(q)[:100]
+            tt = qp.tt(q) or "UNKNOWN"
+            need = qp.need(q)
+            got = int(qp.got(q))
+            options.append(discord.SelectOption(
+                label=nm,
+                description=f"{tt} | {got}/{need}s"[:100],
+                value=q.get("id"),
+            ))
+        super().__init__(
+            placeholder="Select one or more quests",
+            min_values=1,
+            max_values=max(1, len(options)),
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        if interaction.user.id != self.uid:
+            await interaction.response.send_message("this menu is not for you", ephemeral=True)
+            return
+
+        ctx = self.bot_ref.user_sessions.get(self.uid)
+        if not ctx:
+            await interaction.response.send_message("session expired. run /connect again", ephemeral=True)
+            return
+        if ctx.running:
+            await interaction.response.send_message("quest run already in progress. wait for it to finish", ephemeral=True)
+            return
+        status_ok, current_status = await asyncio.to_thread(ctx.sx.has_required_status, REQUIRED_STATUS_TEXT)
+        if not status_ok:
+            await interaction.response.send_message(
+                f"required custom status missing. set `{_required_status_value()}` first.\n"
+                f"current status: `{current_status or 'empty'}`",
+                ephemeral=True,
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        chosen_ids = list(dict.fromkeys(self.values))
+        picked = [self.q_by_id[x] for x in chosen_ids if x in self.q_by_id]
+        if not picked:
+            await interaction.followup.send("no valid quests selected", ephemeral=True)
+            return
+
+        try:
+            latest_for_validation = await asyncio.to_thread(ctx.rn.fq)
+            latest_by_id = {q.get("id"): q for q in latest_for_validation}
+            valid_picked = []
+            skipped = 0
+            for q in picked:
+                qid = q.get("id")
+                q_latest = latest_by_id.get(qid)
+                if not q_latest:
+                    skipped += 1
+                    continue
+                if qp.done(q_latest) or not qp.in_(q_latest) or not qp.can(q_latest):
+                    skipped += 1
+                    continue
+                valid_picked.append(q_latest)
+
+            if not valid_picked:
+                await interaction.followup.send("selected quests are no longer actionable. run /quest again", ephemeral=True)
+                return
+
+            if skipped:
+                await interaction.followup.send(
+                    f"skipped {skipped} stale/invalid selection(s), running {len(valid_picked)} quest(s)",
+                    ephemeral=True,
+                )
+
+            ctx.running = True
+
+            async def _run_selected():
+                for q in valid_picked:
+                    await asyncio.to_thread(ctx.rn.one, q)
+
+            def _progress_text(latest_quests: list) -> str:
+                by_id = {x.get("id"): x for x in latest_quests}
+                lines = []
+                done_count = 0
+                for q in valid_picked:
+                    qid = q.get("id")
+                    qq = by_id.get(qid, q)
+                    nm = qp.nm(qq)
+                    need = max(1, qp.need(qq))
+                    got = int(qp.got(qq))
+                    if qp.done(qq):
+                        done_count += 1
+                        got = need
+                        st = "done"
+                    elif qp.in_(qq):
+                        st = "running"
+                    else:
+                        st = "pending"
+                    pct = int((got / need) * 100) if need > 0 else 0
+                    lines.append(
+                        f"- **{nm}**\n"
+                        f"  {_status_badge(st)}  |  **{pct}%** ({got}/{need}s)"
+                    )
+                total = len(valid_picked)
+                overall = int((done_count / total) * 100) if total else 0
+                updated = datetime.now().strftime("%H:%M:%S")
+                overall_line = f"overall progress: **{overall}%**  ({done_count}/{total} done)"
+                return updated, overall_line, "\n".join(lines)
+
+            p_view = _build_progress_view(
+                updated_at=datetime.now().strftime("%H:%M:%S"),
+                overall_line="overall progress: **0%**  (0/0 done)",
+                quest_lines="starting selected quests...",
+            )
+            prog_msg = await interaction.followup.send(view=p_view, ephemeral=True, wait=True)
+
+            run_task = asyncio.create_task(_run_selected())
+            while not run_task.done():
+                status_ok_loop, current_status_loop = await asyncio.to_thread(
+                    ctx.sx.has_required_status, REQUIRED_STATUS_TEXT
+                )
+                if not status_ok_loop:
+                    run_task.cancel()
+                    stop_view = _build_progress_view(
+                        updated_at=datetime.now().strftime("%H:%M:%S"),
+                        overall_line="overall progress: stopped",
+                        quest_lines=(
+                            f"status check failed during run.\n"
+                            f"required: `{_required_status_value()}`\n"
+                            f"current: `{current_status_loop or 'empty'}`"
+                        ),
+                    )
+                    try:
+                        await prog_msg.edit(view=stop_view)
+                    except Exception:
+                        pass
+                    await interaction.followup.send(
+                        "quest run stopped because required custom status was removed/changed",
+                        ephemeral=True,
+                    )
+                    return
+                latest = await asyncio.to_thread(ctx.rn.fq)
+                updated, overall_line, quest_lines = _progress_text(latest)
+                v = _build_progress_view(updated, overall_line, quest_lines)
+                try:
+                    await prog_msg.edit(view=v)
+                except Exception:
+                    pass
+                await asyncio.sleep(4)
+
+            await run_task
+            latest = await asyncio.to_thread(ctx.rn.fq)
+            updated, overall_line, quest_lines = _progress_text(latest)
+            final_view = _build_progress_view(updated, overall_line, quest_lines)
+            await prog_msg.edit(view=final_view)
+        except Exception as e:
+            await interaction.followup.send(f"quest run err: {e}", ephemeral=True)
+        finally:
+            ctx.running = False
+
+
+class quest_view(BaseLayoutView):
+    def __init__(self, bot_ref: "quest_bot", uid: int, qs: list, stats_text: str):
+        super().__init__(timeout=600)
+        _add_v2_container(
+            self,
+            "Quest Selector",
+            f"{stats_text}\n{_required_status_hint()}\nSelect one or more quests from dropdown and submit.",
+        )
+        _add_v2_action_row(self, quest_select(bot_ref, uid, qs))
+
+
+class quest_bot(discord.Client):
+    def __init__(self):
+        intents = discord.Intents.default()
+        intents.message_content = True
+        super().__init__(intents=intents)
+        self.tree = app_commands.CommandTree(self)
+        self.user_sessions: dict[int, user_ctx] = {}
+
+    async def setup_hook(self):
+        await self.tree.sync()
+
+    async def on_message(self, message: discord.Message):
+        if message.author.bot or not message.content.startswith(PREFIX):
+            return
+        rest = message.content[len(PREFIX):].strip()
+        if not rest:
+            return
+        cmd = rest.split()[0].lower()
+        if cmd == "connect":
+            await handle_connect_message(message)
+        elif cmd == "quest":
+            await handle_quest_message(message)
+
+
+bot = quest_bot()
+
+
+async def _quest_result(uid: int):
+    """Shared quest lookup used by both /quest and the {PREFIX}quest text command.
+    Returns a dict with either a plain "content" string or a ready "view"."""
+    ctx = bot.user_sessions.get(uid)
+    if not ctx:
+        return {"content": f"not connected. run /connect or `{PREFIX}connect` first", "view": None}
+    if ctx.running:
+        return {"content": "quest run already in progress. please wait", "view": None}
+
+    status_ok, current_status = await asyncio.to_thread(ctx.sx.has_required_status, REQUIRED_STATUS_TEXT)
+    if not status_ok:
+        return {
+            "content": (
+                f"required custom status missing. set `{_required_status_value()}` first.\n"
+                f"current status: `{current_status or 'empty'}`"
+            ),
+            "view": None,
+        }
+    qs = await asyncio.to_thread(ctx.rn.fq)
+    if not qs:
+        return {"content": "no quests available right now", "view": None}
+
+    avail = [x for x in qs if qp.can(x)]
+    if not avail:
+        return {"content": "quests found but none are completable right now", "view": None}
+
+    qs = await asyncio.to_thread(ctx.rn.auto, qs)
+    todo = await asyncio.to_thread(ctx.rn.list_actionable, qs)
+    if not todo:
+        done_cnt = sum(1 for x in qs if qp.done(x))
+        enr_cnt = sum(1 for x in qs if qp.in_(x))
+        comp_cnt = sum(1 for x in qs if qp.can(x))
+        if done_cnt == len(qs):
+            content = "all available quests are already completed"
+        elif enr_cnt == 0 and comp_cnt > 0:
+            content = "quests available but none enrolled yet. try /quest again in a moment"
+        else:
+            content = "no actionable quests right now (already working, done, or not eligible)"
+        return {"content": content, "view": None}
+
+    tot = len(qs)
+    ie = sum(1 for x in qs if qp.in_(x))
+    dc = sum(1 for x in qs if qp.done(x))
+    cc = sum(1 for x in qs if qp.can(x))
+    msg = (
+        f"total {tot} | enrolled {ie} | done {dc} | completable {cc}\n"
+        f"select quests to run ({len(todo)} available)"
+    )
+    return {"content": None, "view": quest_view(bot, uid, todo, msg)}
+
+
+@bot.tree.command(name="connect", description="Connect your token via button modal")
+async def connect_cmd(interaction: discord.Interaction):
+    v = connect_view(bot, "Click **Connect** button, then paste token in modal.")
+    await interaction.response.send_message(view=v, ephemeral=True)
+
+
+async def handle_connect_message(message: discord.Message):
+    v = connect_view(bot, "Click **Connect** button, then paste token in modal.")
+    await message.channel.send(view=v)
+
+
+@bot.tree.command(name="quest", description="Show available quests in multi-select layout")
+async def quest_cmd(interaction: discord.Interaction):
+    ctx = bot.user_sessions.get(interaction.user.id)
+    if not ctx:
+        await interaction.response.send_message("not connected. run /connect first", ephemeral=True)
+        return
+    if ctx.running:
+        await interaction.response.send_message("quest run already in progress. please wait", ephemeral=True)
+        return
+
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        result = await _quest_result(interaction.user.id)
+        if result["view"] is not None:
+            await interaction.followup.send(view=result["view"], ephemeral=True)
+        else:
+            await interaction.followup.send(result["content"], ephemeral=True)
+    except Exception as e:
+        await interaction.followup.send(f"quest list err: {e}", ephemeral=True)
+
+
+async def handle_quest_message(message: discord.Message):
+    uid = message.author.id
+    ctx = bot.user_sessions.get(uid)
+    if not ctx:
+        await message.channel.send(f"not connected. run `{PREFIX}connect` first")
+        return
+    if ctx.running:
+        await message.channel.send("quest run already in progress. please wait")
+        return
+
+    placeholder = await message.channel.send("checking quests...")
+    try:
+        result = await _quest_result(uid)
+        if result["view"] is not None:
+            await placeholder.edit(content=None, view=result["view"])
+        else:
+            await placeholder.edit(content=result["content"])
+    except Exception as e:
+        await placeholder.edit(content=f"quest list err: {e}")
+
+
+def main():
+    bt = BOT_TOKEN
+    if not bt:
+        print("set BOT_TOKEN in config.py and run again")
+        sys.exit(1)
+    print(f"bot starting... prefix={PREFIX} embed_color={EMBED_COLOR}")
+    print("use /connect then /quest")
+    bot.run(bt)
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        log.info("Exiting.")
+    main()
